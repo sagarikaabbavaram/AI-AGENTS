@@ -1,0 +1,9 @@
+transformers 
+langgraph 
+langchain 
+langchain-huggingface 
+python-dotenv 
+sentence-transformers 
+streamlit 
+optree>=0.13.0
+openai
