@@ -19,8 +19,10 @@ client = OpenAI(api_key=api_key)
 # Define the state to track the workflow
 class CodeBotState(TypedDict):
     user_request: str
+    language: str
     generated_code: Optional[str]
     feedback: Optional[str]
+    review_issues: Optional[str]
     iteration: int
     error_message: Optional[str]
     is_approved: bool
@@ -28,11 +30,12 @@ class CodeBotState(TypedDict):
 # Node 1: Code Generator
 def generate_code(state: CodeBotState) -> CodeBotState:
     prompt = PromptTemplate(
-        input_variables=["request", "feedback"],
-        template="Generate a clean, functional Python code snippet for: {request}. "
+        input_variables=["language", "request", "feedback"],
+        template="Generate a clean, functional {language} code snippet for: {request}. "
                  "Incorporate feedback if provided: {feedback}."
     )
     input_data = {
+        "language": state["language"],
         "request": state["user_request"],
         "feedback": state["feedback"] or "No feedback."
     }
@@ -48,7 +51,6 @@ def generate_code(state: CodeBotState) -> CodeBotState:
         state["error_message"] = f"Code generation failed: {str(e)}"
         return state
     state["iteration"] += 1
-    state["is_approved"] = False
     state["error_message"] = None
     return state
 
@@ -57,11 +59,11 @@ def review_code(state: CodeBotState) -> CodeBotState:
     if state["error_message"]:
         return state
     prompt = PromptTemplate(
-        input_variables=["code"],
-        template="Review this Python code for correctness and clarity: \n\n{code}\n\n"
+        input_variables=["language", "code"],
+        template="Review this {language} code for correctness and clarity: \n\n{code}\n\n"
                  "Return 'Approved' if no issues, else list specific issues."
     )
-    prompt_text = prompt.format(code=state["generated_code"])
+    prompt_text = prompt.format(language=state["language"], code=state["generated_code"])
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
@@ -70,59 +72,53 @@ def review_code(state: CodeBotState) -> CodeBotState:
         )
         review_result = response.choices[0].message.content.strip()
         state["is_approved"] = "Approved" in review_result
-        state["error_message"] = None if state["is_approved"] else review_result
+        state["review_issues"] = None if state["is_approved"] else review_result
     except Exception as e:
         state["error_message"] = f"Code review failed: {str(e)}"
     return state
 
 # Node 3: Code Optimizer
 def optimize_code(state: CodeBotState) -> CodeBotState:
-    if state["is_approved"] and not state["error_message"]:
-        prompt = PromptTemplate(
-            input_variables=["code"],
-            template="Optimize this Python code for performance and readability: \n\n{code}"
-        )
-        prompt_text = prompt.format(code=state["generated_code"])
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt_text}],
-                max_tokens=500
-            )
-            state["generated_code"] = response.choices[0].message.content.strip()
-        except Exception as e:
-            state["error_message"] = f"Code optimization failed: {str(e)}"
-    return state
-
-# Node 4: Feedback Handler
-def handle_feedback(state: CodeBotState) -> CodeBotState:
-    if state["is_approved"] or state["error_message"]:
-        return state
-    if state["iteration"] >= 3:
-        state["feedback"] = "Max iterations reached."
+    if state["error_message"]:
         return state
     prompt = PromptTemplate(
-        input_variables=["error_message"],
-        template="Provide concise feedback to improve this code based on: {error_message}"
+        input_variables=["language", "code"],
+        template="Optimize this {language} code for performance and readability: \n\n{code}"
     )
-    prompt_text = prompt.format(error_message=state["error_message"])
+    prompt_text = prompt.format(language=state["language"], code=state["generated_code"])
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt_text}],
             max_tokens=500
         )
-        state["feedback"] = response.choices[0].message.content.strip()
+        state["generated_code"] = response.choices[0].message.content.strip()
     except Exception as e:
-        state["error_message"] = f"Feedback generation failed: {str(e)}"
+        state["error_message"] = f"Code optimization failed: {str(e)}"
     return state
 
-# Conditional edge to decide next step
-def decide_next_step(state: CodeBotState) -> str:
+# Node 4: Handle Reviews
+def handle_reviews(state: CodeBotState) -> CodeBotState:
+    if state["error_message"]:
+        return state
+    if state["iteration"] >= 3:
+        state["feedback"] = "Max iterations reached."
+        return state
+    state["feedback"] = state["review_issues"] or "No specific issues provided."
+    return state
+
+# Conditional edge decision for review_code
+def decide_review_next_step(state: CodeBotState) -> str:
     if state["error_message"]:
         return END
     if state["is_approved"]:
         return "optimize_code"
+    return "handle_reviews"
+
+# Conditional edge decision for handle_reviews
+def decide_reviews_next_step(state: CodeBotState) -> str:
+    if state["error_message"]:
+        return END
     if state["iteration"] >= 3:
         return END
     return "generate_code"
@@ -132,18 +128,25 @@ workflow = StateGraph(CodeBotState)
 workflow.add_node("generate_code", generate_code)
 workflow.add_node("review_code", review_code)
 workflow.add_node("optimize_code", optimize_code)
-workflow.add_node("handle_feedback", handle_feedback)
+workflow.add_node("handle_reviews", handle_reviews)
 
 # Add edges
 workflow.add_edge("generate_code", "review_code")
-workflow.add_edge("review_code", "handle_feedback")
 workflow.add_edge("optimize_code", END)
 workflow.add_conditional_edges(
-    "handle_feedback",
-    decide_next_step,
+    "review_code",
+    decide_review_next_step,
+    {
+        "optimize_code": "optimize_code",
+        "handle_reviews": "handle_reviews",
+        END: END
+    }
+)
+workflow.add_conditional_edges(
+    "handle_reviews",
+    decide_reviews_next_step,
     {
         "generate_code": "generate_code",
-        "optimize_code": "optimize_code",
         END: END
     }
 )
@@ -155,11 +158,13 @@ workflow.set_entry_point("generate_code")
 app = workflow.compile()
 
 # Function to run the code generator
-def run_code_generator(user_request: str, user_feedback: Optional[str] = None) -> CodeBotState:
+def run_code_generator(user_request: str, language: str, user_feedback: Optional[str] = None) -> CodeBotState:
     initial_state = CodeBotState(
         user_request=user_request,
+        language=language,
         generated_code=None,
         feedback=user_feedback,
+        review_issues=None,
         iteration=0,
         error_message=None,
         is_approved=False
@@ -169,25 +174,30 @@ def run_code_generator(user_request: str, user_feedback: Optional[str] = None) -
 
 # Streamlit app
 st.title("Agentic AI Code Generator Bot")
-st.write("Enter a coding request to generate, review, and optimize Python code using GPT-4o model.")
+st.write("Enter a coding request and select a programming language to generate, review, and optimize code using GPT-4o model.")
+
+# Input for programming language
+language = st.selectbox("Programming Language", ["Python", "Java", "C++", "JavaScript", "Other (specify)"])
+if language == "Other (specify)":
+    language = st.text_input("Specify Language", placeholder="e.g., Ruby")
 
 # Input for user request
-user_request = st.text_input("Code Request", placeholder="e.g., Write a Python function to reverse a string")
+user_request = st.text_input("Code Request", placeholder="e.g., Write a function to reverse a string")
 
 # Input for user feedback (optional)
 user_feedback = st.text_area("Feedback (optional)", placeholder="e.g., Make it more efficient", height=100)
 
 # Button to generate code
 if st.button("Generate Code"):
-    if user_request:
+    if user_request and language:
         with st.spinner("Generating and optimizing code..."):
             try:
-                result = run_code_generator(user_request, user_feedback)
+                result = run_code_generator(user_request, language, user_feedback)
                 if result["error_message"]:
                     st.error(result["error_message"])
                 else:
                     st.subheader("Generated Code")
-                    st.code(result["generated_code"], language="python")
+                    st.code(result["generated_code"], language=language.lower())
                     st.subheader("Feedback")
                     st.write(result["feedback"] or "No feedback needed.")
                     st.subheader("Iterations")
@@ -195,7 +205,7 @@ if st.button("Generate Code"):
             except Exception as e:
                 st.error(f"Error: {str(e)}")
     else:
-        st.error("Please enter a code request.")
+        st.error("Please enter a code request and select a programming language.")
 
 if __name__ == "__main__":
     st.write("Run this app with: streamlit run code_generator_bot_gpt4_streamlit.py")
