@@ -1,0 +1,7 @@
+langgraph
+langchain
+python-dotenv
+sentence-transformers
+streamlit
+openai
+optree>=0.13.0" 
